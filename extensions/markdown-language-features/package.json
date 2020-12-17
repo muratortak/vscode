@@ -12,7 +12,7 @@
 		"vscode": "^1.20.0"
 	},
 	"main": "./out/extension",
-	"browser": "./dist/extension.js",
+	"browser": "./dist/browser/extension",
 	"categories": [
 		"Programming Languages"
 	],
@@ -78,7 +78,7 @@
 			"editor/title": [
 				{
 					"command": "markdown.showPreviewToSide",
-					"when": "editorLangId == markdown",
+					"when": "editorLangId == markdown && !notebookEditorFocused",
 					"alt": "markdown.showPreview",
 					"group": "navigation"
 				},
@@ -114,23 +114,23 @@
 				{
 					"command": "markdown.showPreview",
 					"when": "resourceLangId == markdown",
-					"group": "navigation"
+					"group": "1_open"
 				}
 			],
 			"commandPalette": [
 				{
 					"command": "markdown.showPreview",
-					"when": "editorLangId == markdown",
+					"when": "editorLangId == markdown && !notebookEditorFocused",
 					"group": "navigation"
 				},
 				{
 					"command": "markdown.showPreviewToSide",
-					"when": "editorLangId == markdown",
+					"when": "editorLangId == markdown && !notebookEditorFocused",
 					"group": "navigation"
 				},
 				{
 					"command": "markdown.showLockedPreviewToSide",
-					"when": "editorLangId == markdown",
+					"when": "editorLangId == markdown && !notebookEditorFocused",
 					"group": "navigation"
 				},
 				{
@@ -140,7 +140,7 @@
 				},
 				{
 					"command": "markdown.showPreviewSecuritySelector",
-					"when": "editorLangId == markdown"
+					"when": "editorLangId == markdown && !notebookEditorFocused"
 				},
 				{
 					"command": "markdown.showPreviewSecuritySelector",
@@ -152,7 +152,7 @@
 				},
 				{
 					"command": "markdown.preview.refresh",
-					"when": "editorLangId == markdown"
+					"when": "editorLangId == markdown && !notebookEditorFocused"
 				},
 				{
 					"command": "markdown.preview.refresh",
@@ -165,13 +165,13 @@
 				"command": "markdown.showPreview",
 				"key": "shift+ctrl+v",
 				"mac": "shift+cmd+v",
-				"when": "editorLangId == markdown"
+				"when": "editorLangId == markdown && !notebookEditorFocused"
 			},
 			{
 				"command": "markdown.showPreviewToSide",
 				"key": "ctrl+k v",
 				"mac": "cmd+k v",
-				"when": "editorLangId == markdown"
+				"when": "editorLangId == markdown && !notebookEditorFocused"
 			}
 		],
 		"configuration": {
@@ -324,14 +324,14 @@
 		"watch-web": "npx webpack-cli --config extension-browser.webpack.config --mode none --watch --info-verbosity verbose"
 	},
 	"dependencies": {
-		"highlight.js": "9.15.10",
-		"markdown-it": "^10.0.0",
+		"highlight.js": "^10.4.1",
+		"markdown-it": "^12.0.3",
 		"markdown-it-front-matter": "^0.2.1",
 		"vscode-extension-telemetry": "0.1.1",
 		"vscode-nls": "^4.0.0"
 	},
 	"devDependencies": {
-		"@types/highlight.js": "9.12.3",
+		"@types/highlight.js": "10.1.0",
 		"@types/lodash.throttle": "^4.1.3",
 		"@types/markdown-it": "0.0.2",
 		"@types/node": "^12.11.7",

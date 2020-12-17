@@ -6,16 +6,20 @@
 //@ts-check
 'use strict';
 
+const performance = require('./vs/base/common/performance');
+performance.mark('fork/start');
+
 const bootstrap = require('./bootstrap');
+const bootstrapNode = require('./bootstrap-node');
 
 // Remove global paths from the node module lookup
-bootstrap.removeGlobalNodeModuleLookupPaths();
+bootstrapNode.removeGlobalNodeModuleLookupPaths();
 
 // Enable ASAR in our forked processes
-bootstrap.enableASARSupport();
+bootstrap.enableASARSupport(undefined);
 
 if (process.env['VSCODE_INJECT_NODE_MODULE_LOOKUP_PATH']) {
-	bootstrap.injectNodeModuleLookupPath(process.env['VSCODE_INJECT_NODE_MODULE_LOOKUP_PATH']);
+	bootstrapNode.injectNodeModuleLookupPath(process.env['VSCODE_INJECT_NODE_MODULE_LOOKUP_PATH']);
 }
 
 // Configure: pipe logging to parent process
@@ -39,6 +43,7 @@ configureCrashReporter();
 // Load AMD entry point
 require('./bootstrap-amd').load(process.env['AMD_ENTRYPOINT']);
 
+
 //#region Helpers
 
 function pipeLoggingToParent() {
@@ -48,8 +53,6 @@ function pipeLoggingToParent() {
 	function safeToArray(args) {
 		const seen = [];
 		const argsArray = [];
-
-		let res;
 
 		// Massage some arguments with special treatment
 		if (args.length) {
@@ -81,11 +84,13 @@ function pipeLoggingToParent() {
 		// to start the stacktrace where the console message was being written
 		if (process.env.VSCODE_LOG_STACK === 'true') {
 			const stack = new Error().stack;
-			argsArray.push({ __$stack: stack.split('\n').slice(3).join('\n') });
+			if (stack) {
+				argsArray.push({ __$stack: stack.split('\n').slice(3).join('\n') });
+			}
 		}
 
 		try {
-			res = JSON.stringify(argsArray, function (key, value) {
+			const res = JSON.stringify(argsArray, function (key, value) {
 
 				// Objects get special treatment to prevent circles
 				if (isObject(value) || Array.isArray(value)) {
@@ -98,15 +103,15 @@ function pipeLoggingToParent() {
 
 				return value;
 			});
+
+			if (res.length > MAX_LENGTH) {
+				return 'Output omitted for a large object that exceeds the limits';
+			}
+
+			return res;
 		} catch (error) {
-			return 'Output omitted for an object that cannot be inspected (' + error.toString() + ')';
+			return `Output omitted for an object that cannot be inspected ('${error.toString()}')`;
 		}
-
-		if (res && res.length > MAX_LENGTH) {
-			return 'Output omitted for a large object that exceeds the limits';
-		}
-
-		return res;
 	}
 
 	/**
@@ -114,7 +119,9 @@ function pipeLoggingToParent() {
 	 */
 	function safeSend(arg) {
 		try {
-			process.send(arg);
+			if (process.send) {
+				process.send(arg);
+			}
 		} catch (error) {
 			// Can happen if the parent channel is closed meanwhile
 		}
@@ -131,18 +138,47 @@ function pipeLoggingToParent() {
 			&& !(obj instanceof Date);
 	}
 
+	/**
+	 *
+	 * @param {'log' | 'warn' | 'error'} severity
+	 * @param {string} args
+	 */
+	function safeSendConsoleMessage(severity, args) {
+		safeSend({ type: '__$console', severity, arguments: args });
+	}
+
+	/**
+	 * @param {'log' | 'info' | 'warn' | 'error'} method
+	 * @param {'log' | 'warn' | 'error'} severity
+	 */
+	function wrapConsoleMethod(method, severity) {
+		if (process.env.VSCODE_LOG_NATIVE === 'true') {
+			const original = console[method];
+			console[method] = function () {
+				safeSendConsoleMessage(severity, safeToArray(arguments));
+
+				const stream = method === 'error' || method === 'warn' ? process.stderr : process.stdout;
+				stream.write('\nSTART_NATIVE_LOG\n');
+				original.apply(console, arguments);
+				stream.write('\nEND_NATIVE_LOG\n');
+			};
+		} else {
+			console[method] = function () { safeSendConsoleMessage(severity, safeToArray(arguments)); };
+		}
+	}
+
 	// Pass console logging to the outside so that we have it in the main side if told so
 	if (process.env.VERBOSE_LOGGING === 'true') {
-		console.log = function () { safeSend({ type: '__$console', severity: 'log', arguments: safeToArray(arguments) }); };
-		console.info = function () { safeSend({ type: '__$console', severity: 'log', arguments: safeToArray(arguments) }); };
-		console.warn = function () { safeSend({ type: '__$console', severity: 'warn', arguments: safeToArray(arguments) }); };
-	} else {
+		wrapConsoleMethod('info', 'log');
+		wrapConsoleMethod('log', 'log');
+		wrapConsoleMethod('warn', 'warn');
+		wrapConsoleMethod('error', 'error');
+	} else if (process.env.VSCODE_LOG_NATIVE !== 'true') {
 		console.log = function () { /* ignore */ };
 		console.warn = function () { /* ignore */ };
 		console.info = function () { /* ignore */ };
+		wrapConsoleMethod('error', 'error');
 	}
-
-	console.error = function () { safeSend({ type: '__$console', severity: 'error', arguments: safeToArray(arguments) }); };
 }
 
 function handleExceptions() {

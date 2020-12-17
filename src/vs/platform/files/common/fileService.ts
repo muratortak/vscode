@@ -19,6 +19,8 @@ import { Queue } from 'vs/base/common/async';
 import { CancellationTokenSource, CancellationToken } from 'vs/base/common/cancellation';
 import { Schemas } from 'vs/base/common/network';
 import { readFileIntoStream } from 'vs/platform/files/common/io';
+import { Iterable } from 'vs/base/common/iterator';
+import * as perf from 'vs/base/common/performance';
 
 export class FileService extends Disposable implements IFileService {
 
@@ -26,19 +28,19 @@ export class FileService extends Disposable implements IFileService {
 
 	private readonly BUFFER_SIZE = 64 * 1024;
 
-	constructor(@ILogService private logService: ILogService) {
+	constructor(@ILogService private readonly logService: ILogService) {
 		super();
 	}
 
 	//#region File System Provider
 
-	private _onDidChangeFileSystemProviderRegistrations = this._register(new Emitter<IFileSystemProviderRegistrationEvent>());
+	private readonly _onDidChangeFileSystemProviderRegistrations = this._register(new Emitter<IFileSystemProviderRegistrationEvent>());
 	readonly onDidChangeFileSystemProviderRegistrations = this._onDidChangeFileSystemProviderRegistrations.event;
 
-	private _onWillActivateFileSystemProvider = this._register(new Emitter<IFileSystemProviderActivationEvent>());
+	private readonly _onWillActivateFileSystemProvider = this._register(new Emitter<IFileSystemProviderActivationEvent>());
 	readonly onWillActivateFileSystemProvider = this._onWillActivateFileSystemProvider.event;
 
-	private _onDidChangeFileSystemProviderCapabilities = this._register(new Emitter<IFileSystemProviderCapabilitiesChangeEvent>());
+	private readonly _onDidChangeFileSystemProviderCapabilities = this._register(new Emitter<IFileSystemProviderCapabilitiesChangeEvent>());
 	readonly onDidChangeFileSystemProviderCapabilities = this._onDidChangeFileSystemProviderCapabilities.event;
 
 	private readonly provider = new Map<string, IFileSystemProvider>();
@@ -48,13 +50,15 @@ export class FileService extends Disposable implements IFileService {
 			throw new Error(`A filesystem provider for the scheme '${scheme}' is already registered.`);
 		}
 
+		perf.mark(`code/registerFilesystem/${scheme}`);
+
 		// Add provider with event
 		this.provider.set(scheme, provider);
 		this._onDidChangeFileSystemProviderRegistrations.fire({ added: true, scheme, provider });
 
 		// Forward events from provider
 		const providerDisposables = new DisposableStore();
-		providerDisposables.add(provider.onDidChangeFile(changes => this._onDidFilesChange.fire(new FileChangesEvent(changes, this.getExtUri(provider).extUri))));
+		providerDisposables.add(provider.onDidChangeFile(changes => this._onDidFilesChange.fire(new FileChangesEvent(changes, !this.isPathCaseSensitive(provider)))));
 		providerDisposables.add(provider.onDidChangeCapabilities(() => this._onDidChangeFileSystemProviderCapabilities.fire({ provider, scheme })));
 		if (typeof provider.onDidErrorOccur === 'function') {
 			providerDisposables.add(provider.onDidErrorOccur(error => this._onError.fire(new Error(error))));
@@ -99,6 +103,10 @@ export class FileService extends Disposable implements IFileService {
 		const provider = this.provider.get(resource.scheme);
 
 		return !!(provider && (provider.capabilities & capability));
+	}
+
+	listCapabilities(): Iterable<{ scheme: string, capabilities: FileSystemProviderCapabilities }> {
+		return Iterable.map(this.provider, ([scheme, provider]) => ({ scheme, capabilities: provider.capabilities }));
 	}
 
 	protected async withProvider(resource: URI): Promise<IFileSystemProvider> {
@@ -146,10 +154,10 @@ export class FileService extends Disposable implements IFileService {
 
 	//#endregion
 
-	private _onDidRunOperation = this._register(new Emitter<FileOperationEvent>());
+	private readonly _onDidRunOperation = this._register(new Emitter<FileOperationEvent>());
 	readonly onDidRunOperation = this._onDidRunOperation.event;
 
-	private _onError = this._register(new Emitter<Error>());
+	private readonly _onError = this._register(new Emitter<Error>());
 	readonly onError = this._onError.event;
 
 	//#region File Metadata Resolving
@@ -175,6 +183,7 @@ export class FileService extends Disposable implements IFileService {
 	private async doResolveFile(resource: URI, options?: IResolveFileOptions): Promise<IFileStat>;
 	private async doResolveFile(resource: URI, options?: IResolveFileOptions): Promise<IFileStat> {
 		const provider = await this.withProvider(resource);
+		const isPathCaseSensitive = this.isPathCaseSensitive(provider);
 
 		const resolveTo = options?.resolveTo;
 		const resolveSingleChildDescendants = options?.resolveSingleChildDescendants;
@@ -188,7 +197,7 @@ export class FileService extends Disposable implements IFileService {
 
 			// lazy trie to check for recursive resolving
 			if (!trie) {
-				trie = TernarySearchTree.forUris<true>();
+				trie = TernarySearchTree.forUris<true>(() => !isPathCaseSensitive);
 				trie.set(resource, true);
 				if (isNonEmptyArray(resolveTo)) {
 					resolveTo.forEach(uri => trie!.set(uri, true));
@@ -287,12 +296,28 @@ export class FileService extends Disposable implements IFileService {
 
 	//#region File Reading/Writing
 
-	async createFile(resource: URI, bufferOrReadableOrStream: VSBuffer | VSBufferReadable | VSBufferReadableStream = VSBuffer.fromString(''), options?: ICreateFileOptions): Promise<IFileStatWithMetadata> {
+	async canCreateFile(resource: URI, options?: ICreateFileOptions): Promise<Error | true> {
+		try {
+			await this.doValidateCreateFile(resource, options);
+		} catch (error) {
+			return error;
+		}
+
+		return true;
+	}
+
+	private async doValidateCreateFile(resource: URI, options?: ICreateFileOptions): Promise<void> {
 
 		// validate overwrite
 		if (!options?.overwrite && await this.exists(resource)) {
 			throw new FileOperationError(localize('fileExists', "Unable to create file '{0}' that already exists when overwrite flag is not set", this.resourceForError(resource)), FileOperationResult.FILE_MODIFIED_SINCE, options);
 		}
+	}
+
+	async createFile(resource: URI, bufferOrReadableOrStream: VSBuffer | VSBufferReadable | VSBufferReadableStream = VSBuffer.fromString(''), options?: ICreateFileOptions): Promise<IFileStatWithMetadata> {
+
+		// validate
+		await this.doValidateCreateFile(resource, options);
 
 		// do write into file (this will create it too)
 		const fileStat = await this.writeFile(resource, bufferOrReadableOrStream);
@@ -703,16 +728,16 @@ export class FileService extends Disposable implements IFileService {
 
 		// Check if source is equal or parent to target (requires providers to be the same)
 		if (sourceProvider === targetProvider) {
-			const { extUri, isPathCaseSensitive } = this.getExtUri(sourceProvider);
+			const { providerExtUri, isPathCaseSensitive } = this.getExtUri(sourceProvider);
 			if (!isPathCaseSensitive) {
-				isSameResourceWithDifferentPathCase = extUri.isEqual(source, target);
+				isSameResourceWithDifferentPathCase = providerExtUri.isEqual(source, target);
 			}
 
 			if (isSameResourceWithDifferentPathCase && mode === 'copy') {
 				throw new Error(localize('unableToMoveCopyError1', "Unable to copy when source '{0}' is same as target '{1}' with different path case on a case insensitive file system", this.resourceForError(source), this.resourceForError(target)));
 			}
 
-			if (!isSameResourceWithDifferentPathCase && extUri.isEqualOrParent(target, source)) {
+			if (!isSameResourceWithDifferentPathCase && providerExtUri.isEqualOrParent(target, source)) {
 				throw new Error(localize('unableToMoveCopyError2', "Unable to move/copy when source '{0}' is parent of target '{1}'.", this.resourceForError(source), this.resourceForError(target)));
 			}
 		}
@@ -729,8 +754,8 @@ export class FileService extends Disposable implements IFileService {
 			// Special case: if the target is a parent of the source, we cannot delete
 			// it as it would delete the source as well. In this case we have to throw
 			if (sourceProvider === targetProvider) {
-				const { extUri } = this.getExtUri(sourceProvider);
-				if (extUri.isEqualOrParent(source, target)) {
+				const { providerExtUri } = this.getExtUri(sourceProvider);
+				if (providerExtUri.isEqualOrParent(source, target)) {
 					throw new Error(localize('unableToMoveCopyError4', "Unable to move/copy '{0}' into '{1}' since a file would replace the folder it is contained in.", this.resourceForError(source), this.resourceForError(target)));
 				}
 			}
@@ -739,13 +764,17 @@ export class FileService extends Disposable implements IFileService {
 		return { exists, isSameResourceWithDifferentPathCase };
 	}
 
-	private getExtUri(provider: IFileSystemProvider): { extUri: IExtUri, isPathCaseSensitive: boolean } {
-		const isPathCaseSensitive = !!(provider.capabilities & FileSystemProviderCapabilities.PathCaseSensitive);
+	private getExtUri(provider: IFileSystemProvider): { providerExtUri: IExtUri, isPathCaseSensitive: boolean } {
+		const isPathCaseSensitive = this.isPathCaseSensitive(provider);
 
 		return {
-			extUri: isPathCaseSensitive ? extUri : extUriIgnorePathCase,
+			providerExtUri: isPathCaseSensitive ? extUri : extUriIgnorePathCase,
 			isPathCaseSensitive
 		};
+	}
+
+	private isPathCaseSensitive(provider: IFileSystemProvider): boolean {
+		return !!(provider.capabilities & FileSystemProviderCapabilities.PathCaseSensitive);
 	}
 
 	async createFolder(resource: URI): Promise<IFileStatWithMetadata> {
@@ -765,8 +794,8 @@ export class FileService extends Disposable implements IFileService {
 		const directoriesToCreate: string[] = [];
 
 		// mkdir until we reach root
-		const { extUri } = this.getExtUri(provider);
-		while (!extUri.isEqual(directory, dirname(directory))) {
+		const { providerExtUri } = this.getExtUri(provider);
+		while (!providerExtUri.isEqual(directory, dirname(directory))) {
 			try {
 				const stat = await provider.stat(directory);
 				if ((stat.type & FileType.Directory) === 0) {
@@ -865,10 +894,10 @@ export class FileService extends Disposable implements IFileService {
 
 	//#region File Watching
 
-	private _onDidFilesChange = this._register(new Emitter<FileChangesEvent>());
+	private readonly _onDidFilesChange = this._register(new Emitter<FileChangesEvent>());
 	readonly onDidFilesChange = this._onDidFilesChange.event;
 
-	private activeWatchers = new Map<string, { disposable: IDisposable, count: number }>();
+	private readonly activeWatchers = new Map<string, { disposable: IDisposable, count: number }>();
 
 	watch(resource: URI, options: IWatchOptions = { recursive: false, excludes: [] }): IDisposable {
 		let watchDisposed = false;
@@ -914,12 +943,12 @@ export class FileService extends Disposable implements IFileService {
 	}
 
 	private toWatchKey(provider: IFileSystemProvider, resource: URI, options: IWatchOptions): string {
-		const { extUri } = this.getExtUri(provider);
+		const { providerExtUri } = this.getExtUri(provider);
 
 		return [
-			extUri.getComparisonKey(resource), 	// lowercase path if the provider is case insensitive
-			String(options.recursive),			// use recursive: true | false as part of the key
-			options.excludes.join()				// use excludes as part of the key
+			providerExtUri.getComparisonKey(resource), 	// lowercase path if the provider is case insensitive
+			String(options.recursive),					// use recursive: true | false as part of the key
+			options.excludes.join()						// use excludes as part of the key
 		].join();
 	}
 
@@ -934,11 +963,11 @@ export class FileService extends Disposable implements IFileService {
 
 	//#region Helpers
 
-	private writeQueues: Map<string, Queue<void>> = new Map();
+	private readonly writeQueues: Map<string, Queue<void>> = new Map();
 
 	private ensureWriteQueue(provider: IFileSystemProvider, resource: URI): Queue<void> {
-		const { extUri } = this.getExtUri(provider);
-		const queueKey = extUri.getComparisonKey(resource);
+		const { providerExtUri } = this.getExtUri(provider);
+		const queueKey = providerExtUri.getComparisonKey(resource);
 
 		// ensure to never write to the same resource without finishing
 		// the one write. this ensures a write finishes consistently
